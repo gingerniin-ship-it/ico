@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Инди-геометрия: Икосаэдр</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #05050A; /* Глубокий индиго/черный */
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            touch-action: none; /* Запрет системных свайпов */
+            font-family: sans-serif;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        #hint {
+            position: absolute;
+            bottom: 40px;
+            color: rgba(127, 255, 212, 0.4);
+            font-size: 14px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            pointer-events: none;
+            transition: opacity 1s ease;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="geometryCanvas"></canvas>
+    <div id="hint">Коснитесь экрана</div>
+
+    <script>
+        const canvas = document.getElementById('geometryCanvas');
+        const ctx = canvas.getContext('2d', { alpha: false }); // alpha false для оптимизации
+        const hint = document.getElementById('hint');
+
+        let width, height, cx, cy;
+
+        function resize() {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+            cx = width / 2;
+            cy = height / 2;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // --- 1. ГЕНЕРАЦИЯ ГЕОМЕТРИИ ИКОСАЭДРА ---
+        const PHI = (1 + Math.sqrt(5)) / 2;
+        const RADIUS = 120; // Базовый размер фигуры
+
+        // Вершины икосаэдра (12 точек)
+        const baseVertices = [
+            [-1,  PHI, 0], [ 1,  PHI, 0], [-1, -PHI, 0], [ 1, -PHI, 0],
+            [0, -1,  PHI], [0,  1,  PHI], [0, -1, -PHI], [0,  1, -PHI],
+            [ PHI, 0, -1], [ PHI, 0,  1], [-PHI, 0, -1], [-PHI, 0,  1]
+        ].map(v => {
+            // Нормализация и масштабирование
+            const len = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            return { x: (v[0]/len)*RADIUS, y: (v[1]/len)*RADIUS, z: (v[2]/len)*RADIUS };
+        });
+
+        // Индексы граней (20 треугольников)
+        const faceIndices = [
+            [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+            [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+            [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+            [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
+        ];
+
+        // Подготовка граней с нормалями для анимации разрыва
+        const faces = faceIndices.map(indices => {
+            const v0 = baseVertices[indices[0]];
+            const v1 = baseVertices[indices[1]];
+            const v2 = baseVertices[indices[2]];
+            
+            // Центр грани (куда направлена нормаль)
+            const cx = (v0.x + v1.x + v2.x) / 3;
+            const cy = (v0.y + v1.y + v2.y) / 3;
+            const cz = (v0.z + v1.z + v2.z) / 3;
+            
+            const len = Math.sqrt(cx*cx + cy*cy + cz*cz);
+            
+            return {
+                indices,
+                normal: { x: cx/len, y: cy/len, z: cz/len } // Вектор направления разрыва
+            };
+        });
+
+        // --- 2. МАТЕМАТИКА 3D И ПРОЕКЦИИ ---
+        function rotateX(point, angle) {
+            const cos = Math.cos(angle);
+            const sin = Math.sin(angle);
+            return {
+                x: point.x,
+                y: point.y * cos - point.z * sin,
+                z: point.y * sin + point.z * cos
+            };
+        }
+
+        function rotateY(point, angle) {
+            const cos = Math.cos(angle);
+            const sin = Math.sin(angle);
+            return {
+                x: point.x * cos + point.z * sin,
+                y: point.y,
+                z: -point.x * sin + point.z * cos
+            };
+        }
+
+        function project(point, cameraZ, fov) {
+            const z = point.z + cameraZ;
+            // Предотвращение деления на ноль или инверсии
+            if (z < 0.1) return null; 
+            const scale = fov / z;
+            return {
+                x: cx + point.x * scale,
+                y: cy + point.y * scale,
+                scale: scale
+            };
+        }
+
+        // --- 3. СТЕЙТ-МАШИНА И ПЕРЕМЕННЫЕ АНИМАЦИИ ---
+        const STATES = { IDLE: 0, OPENING: 1, SLEEP: 2, CLOSING: 3 };
+        let currentState = STATES.IDLE;
+        
+        let rotX = 0;
+        let rotY = 0;
+        let velocityX = 0.003;
+        let velocityY = 0.005;
+        
+        let startRotX = 0;
+        let startRotY = 0;
+        let targetRotX = 0;
+        let targetRotY = 0;
+
+        let explodeOffset = 0; // 0 (закрыт) до 1.5 (открыт)
+        const MAX_EXPLODE = 140; // Расстояние разлета граней
+        let transitionProgress = 0; // от 0 до 1
+        const TRANSITION_SPEED = 0.012; // Скорость анимации раскрытия/закрытия
+
+        let sleepTime = 0; // Время для синусоиды "дыхания"
+
+        // Easing function: Cubic In/Out для плавности инди-игр
+        function easeInOutCubic(t) {
+            return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+
+        // Вычисление ближайшего красивого симметричного ракурса
+        function getNearestSymmetricAngle(currentAngle, step) {
+            return Math.round(currentAngle / step) * step;
+        }
+
+        // Обработка клика
+        function handleInteraction() {
+            if (currentState === STATES.IDLE) {
+                // Переход в фазу Раскрытия
+                currentState = STATES.OPENING;
+                transitionProgress = 0;
+                startRotX = rotX;
+                startRotY = rotY;
+                
+                // Фигура зафиксируется на красивой симметричной оси (шаг PI/5 и PI/2)
+                targetRotX = getNearestSymmetricAngle(rotX, Math.PI / 2);
+                targetRotY = getNearestSymmetricAngle(rotY, Math.PI / 5);
+                
+                hint.style.opacity = '0';
+            } 
+            else if (currentState === STATES.SLEEP) {
+                // Переход в фазу Закрытия
+                currentState = STATES.CLOSING;
+                transitionProgress = 1;
+                // Слегка меняем ось, чтобы при пробуждении оно снова начало вращаться
+                velocityX = (Math.random() - 0.5) * 0.01;
+                velocityY = (Math.random() - 0.5) * 0.01;
+                
+                hint.style.opacity = '1';
+            }
+        }
+
+        window.addEventListener('mousedown', handleInteraction);
+        window.addEventListener('touchstart', handleInteraction);
+
+        // --- 4. РЕНДЕР-ЦИКЛ ---
+        function animate() {
+            // Очистка фона
+            ctx.fillStyle = '#05050A';
+            ctx.fillRect(0, 0, width, height);
+
+            // Градиент для линий (Мятный -> Песочный)
+            const gradient = ctx.createLinearGradient(cx - RADIUS*2, cy - RADIUS*2, cx + RADIUS*2, cy + RADIUS*2);
+            gradient.addColorStop(0, '#7FFFD4'); // Aquamarine/Мятный
+            gradient.addColorStop(1, '#F4A460'); // SandyBrown/Песочный
+            ctx.strokeStyle = gradient;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+
+            // Глобальные трансформации камеры и эффектов
+            let cameraZ = 450;
+            let currentFov = 600;
+            let currentGlow = 10;
+            
+            // Логика состояний
+            if (currentState === STATES.IDLE) {
+                rotX += velocityX;
+                rotY += velocityY;
+                explodeOffset = 0;
+            } 
+            else if (currentState === STATES.OPENING) {
+                transitionProgress += TRANSITION_SPEED;
+                if (transitionProgress >= 1) {
+                    transitionProgress = 1;
+                    currentState = STATES.SLEEP;
+                    sleepTime = 0;
+                }
+                const ease = easeInOutCubic(transitionProgress);
+                rotX = startRotX + (targetRotX - startRotX) * ease;
+                rotY = startRotY + (targetRotY - startRotY) * ease;
+                explodeOffset = ease * MAX_EXPLODE;
+            }
+            else if (currentState === STATES.SLEEP) {
+                sleepTime += 0.02;
+                // Пульсация "дыхание"
+                const breath = Math.sin(sleepTime);
+                explodeOffset = MAX_EXPLODE + breath * 15; // Движение осколков
+                currentFov = 600 + breath * 30; // Легкий зум
+                currentGlow = 15 + breath * 8; // Пульсация свечения
+                
+                // Очень медленный дрейф
+                rotY += 0.001; 
+                rotX += 0.0005;
+            }
+            else if (currentState === STATES.CLOSING) {
+                transitionProgress -= TRANSITION_SPEED;
+                if (transitionProgress <= 0) {
+                    transitionProgress = 0;
+                    currentState = STATES.IDLE;
+                }
+                const ease = easeInOutCubic(transitionProgress);
+                // Продолжаем вращение от точки, где остановились
+                rotX = targetRotX + velocityX * (1 - ease) * 50; 
+                rotY = targetRotY + velocityY * (1 - ease) * 50;
+                explodeOffset = ease * MAX_EXPLODE;
+            }
+
+            // Отрисовка граней
+            faces.forEach(face => {
+                // 1. Получаем вершины грани
+                const pts = face.indices.map(i => baseVertices[i]);
+                
+                // 2. Сдвиг вдоль нормали (Взрыв / Раскрытие)
+                const explodedPts = pts.map(p => ({
+                    x: p.x + face.normal.x * explodeOffset,
+                    y: p.y + face.normal.y * explodeOffset,
+                    z: p.z + face.normal.z * explodeOffset
+                }));
+
+                // 3. Вращение
+                const rotatedPts = explodedPts.map(p => {
+                    let rp = rotateX(p, rotX);
+                    return rotateY(rp, rotY);
+                });
+
+                // 4. Backface Culling / Вычисление направления нормали грани после вращения
+                // Чтобы определить, смотрит ли грань от нас, берем вектор нормали и тоже его вращаем
+                const rn = rotateY(rotateX(face.normal, rotX), rotY);
+                const isBackface = rn.z > 0;
+
+                // 5. Проекция
+                const projPts = rotatedPts.map(p => project(p, cameraZ, currentFov));
+                
+                if (projPts.some(p => !p)) return; // Защита камеры
+
+                // Настройка прозрачности и свечения для глубины (backface culling)
+                if (isBackface) {
+                    ctx.globalAlpha = 0.15; // Задние грани тусклые
+                    ctx.shadowBlur = 0;
+                    ctx.lineWidth = 1;
+                } else {
+                    ctx.globalAlpha = 1.0;  // Передние грани яркие
+                    ctx.shadowColor = '#7FFFD4';
+                    ctx.shadowBlur = currentGlow;
+                    ctx.lineWidth = 1.5;
+                }
+
+                // 6. Отрисовка контура треугольника
+                ctx.beginPath();
+                ctx.moveTo(projPts[0].x, projPts[0].y);
+                ctx.lineTo(projPts[1].x, projPts[1].y);
+                ctx.lineTo(projPts[2].x, projPts[2].y);
+                ctx.closePath();
+                ctx.stroke();
+            });
+
+            requestAnimationFrame(animate);
+        }
+
+        // Запуск
+        animate();
+
+    </script>
+</body>
+</html>
